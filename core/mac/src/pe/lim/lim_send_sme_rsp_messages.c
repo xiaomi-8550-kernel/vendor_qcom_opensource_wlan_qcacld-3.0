@@ -1,6 +1,6 @@
 /*
  * Copyright (c) 2012-2021 The Linux Foundation. All rights reserved.
- * Copyright (c) 2022-2023 Qualcomm Innovation Center, Inc. All rights reserved.
+ * Copyright (c) 2022-2024 Qualcomm Innovation Center, Inc. All rights reserved.
  *
  * Permission to use, copy, modify, and/or distribute this software for
  * any purpose with or without fee is hereby granted, provided that the
@@ -1882,13 +1882,8 @@ void lim_handle_sta_csa_param(struct mac_context *mac_ctx,
 	chnl_switch_info =
 		&session_entry->gLimWiderBWChannelSwitch;
 
-	if (WLAN_REG_IS_24GHZ_CH_FREQ(csa_params->csa_chan_freq)) {
-		channel_bonding_mode =
-			mac_ctx->roam.configParam.channelBondingMode24GHz;
-	} else {
-		channel_bonding_mode =
-			mac_ctx->roam.configParam.channelBondingMode5GHz;
-	}
+	channel_bonding_mode = lim_get_cb_mode_for_freq(mac_ctx, session_entry,
+						   csa_params->csa_chan_freq);
 
 	pe_debug("Session %d vdev %d: vht: %d ht: %d he %d cbmode %d",
 		 session_entry->peSessionId, session_entry->vdev_id,
@@ -2110,6 +2105,7 @@ void lim_handle_sta_csa_param(struct mac_context *mac_ctx,
 	    session_entry->ch_width == lim_ch_switch->ch_width &&
 	    lim_is_puncture_same(lim_ch_switch, session_entry)) {
 		pe_debug("Ignore CSA, no change in ch, bw and puncture");
+		wlan_mlme_send_csa_event_status_ind(session_entry->vdev, 0);
 		goto err;
 	}
 

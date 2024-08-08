@@ -86,6 +86,7 @@
 #include "wlan_mlo_mgr_sta.h"
 #include "wlan_mlo_mgr_peer.h"
 #include <wlan_twt_api.h>
+#include <wlan_cm_api.h>
 
 struct pe_hang_event_fixed_param {
 	uint16_t tlv_header;
@@ -1407,7 +1408,8 @@ void pe_register_callbacks_with_wma(struct mac_context *mac,
 	status = wma_register_roaming_callbacks(
 			ready_req->csr_roam_auth_event_handle_cb,
 			ready_req->pe_roam_synch_cb,
-			ready_req->pe_disconnect_cb);
+			ready_req->pe_disconnect_cb,
+			ready_req->pe_roam_set_ie_cb);
 	if (status != QDF_STATUS_SUCCESS)
 		pe_err("Registering roaming callbacks with WMA failed");
 }
@@ -3164,6 +3166,19 @@ roam_sync_fail:
 	pe_delete_session(mac_ctx, ft_session_ptr);
 	return status;
 }
+
+QDF_STATUS
+pe_set_ie_for_roam_invoke(struct mac_context *mac_ctx, uint8_t vdev_id,
+			  uint16_t dot11_mode, enum QDF_OPMODE opmode)
+{
+	QDF_STATUS status;
+
+	if (!mac_ctx)
+		return QDF_STATUS_E_FAILURE;
+
+	status = lim_send_ies_per_band(mac_ctx, vdev_id, dot11_mode, opmode);
+	return status;
+}
 #endif
 
 static bool lim_is_beacon_miss_scenario(struct mac_context *mac,
@@ -4052,14 +4067,14 @@ lim_update_mlo_mgr_info(struct mac_context *mac_ctx,
 					wlan_pdev_get_psoc(mac_ctx->pdev),
 					cache_entry);
 
+	util_scan_free_cache_entry(cache_entry);
+
 	if (!is_security_allowed) {
 		mlme_debug("current security is not valid for partner link link_addr:" QDF_MAC_ADDR_FMT,
 			   QDF_MAC_ADDR_REF(link_addr->bytes));
-		util_scan_free_cache_entry(cache_entry);
 		return QDF_STATUS_E_FAILURE;
 	}
 
-	util_scan_free_cache_entry(cache_entry);
 	return QDF_STATUS_SUCCESS;
 }
 #else
@@ -4096,13 +4111,107 @@ QDF_STATUS lim_check_for_ml_probe_req(struct pe_session *session)
 	return QDF_STATUS_E_FAILURE;
 }
 
-QDF_STATUS
-lim_gen_link_specific_probe_rsp(struct mac_context *mac_ctx,
-				struct pe_session *session_entry,
-				tpSirProbeRespBeacon rcvd_probe_resp,
-				uint8_t *probe_rsp,
-				uint32_t probe_rsp_len,
-				int32_t rssi)
+static QDF_STATUS lim_check_partner_link_for_cmn_akm(struct pe_session *session)
+{
+	struct scan_filter *filter;
+	qdf_list_t *scan_list = NULL;
+	struct wlan_objmgr_pdev *pdev;
+	uint8_t idx;
+	struct mlo_link_info *link_info;
+	struct scan_cache_entry *cur_entry;
+	struct scan_cache_node *link_node;
+	struct mlo_partner_info *partner_info;
+	struct qdf_mac_addr mld_addr = {0};
+	qdf_list_node_t *cur_node = NULL, *next_node = NULL;
+	QDF_STATUS status = QDF_STATUS_SUCCESS;
+
+	pdev =  wlan_vdev_get_pdev(session->vdev);
+	if (!pdev) {
+		pe_err("PDEV NULL");
+		return QDF_STATUS_E_NULL_VALUE;
+	}
+
+	cur_entry =
+		wlan_cm_get_curr_candidate_entry(session->vdev, session->cm_id);
+	if (!cur_entry) {
+		pe_err("Current candidate NULL");
+		return QDF_STATUS_E_NULL_VALUE;
+	}
+
+	filter = qdf_mem_malloc(sizeof(*filter));
+	if (!filter) {
+		status = QDF_STATUS_E_NOMEM;
+		goto mem_free;
+	}
+
+	partner_info = &session->lim_join_req->partner_info;
+	for (idx = 0; idx < partner_info->num_partner_links; idx++) {
+		link_info = &partner_info->partner_link_info[idx];
+		qdf_copy_macaddr(&filter->bssid_list[idx],
+				 &link_info->link_addr);
+		filter->num_of_bssid++;
+
+		filter->chan_freq_list[idx] = link_info->chan_freq;
+		filter->num_of_channels++;
+		pe_debug("Filter BSSID: " QDF_MAC_ADDR_FMT ", freq: %d",
+			 QDF_MAC_ADDR_REF(filter->bssid_list[idx].bytes),
+			 filter->chan_freq_list[idx]);
+	}
+
+	wlan_vdev_get_bss_peer_mld_mac(session->vdev, &mld_addr);
+	filter->match_mld_addr = true;
+	qdf_copy_macaddr(&filter->mld_addr, &mld_addr);
+
+	/* If no.of. scan entries fetched not equal to no.of partner links
+	 * then fail as common AKM is not determined.
+	 */
+	scan_list = wlan_scan_get_result(pdev, filter);
+	qdf_mem_free(filter);
+	if (!scan_list) {
+		pe_debug("Empty scan list");
+		status = QDF_STATUS_E_NULL_VALUE;
+		goto mem_free;
+	}
+
+	qdf_list_peek_front(scan_list, &cur_node);
+	while (cur_node) {
+		qdf_list_peek_next(scan_list, cur_node, &next_node);
+		link_node = qdf_container_of(cur_node, struct scan_cache_node,
+					     node);
+
+		pe_debug("Entry BSSID: " QDF_MAC_ADDR_FMT ", freq %d",
+			 QDF_MAC_ADDR_REF(link_node->entry->bssid.bytes),
+			 link_node->entry->channel.chan_freq);
+
+		if (!wlan_scan_entries_contain_cmn_akm(cur_entry,
+						       link_node->entry)) {
+			status = QDF_STATUS_E_FAILURE;
+			break;
+		}
+
+		cur_node = next_node;
+		next_node = NULL;
+	}
+
+	if (qdf_list_size(scan_list) != partner_info->num_partner_links) {
+		pe_err("Scan list (%d), actual partner links (%d)",
+		       qdf_list_size(scan_list),
+		       partner_info->num_partner_links);
+		status = QDF_STATUS_E_INVAL;
+	}
+
+mem_free:
+	if (scan_list)
+		wlan_scan_purge_results(scan_list);
+	util_scan_free_cache_entry(cur_entry);
+	return status;
+}
+
+QDF_STATUS lim_gen_link_specific_probe_rsp(struct mac_context *mac_ctx,
+					   struct pe_session *session_entry,
+					   tpSirProbeRespBeacon rcvd_probe_resp,
+					   uint8_t *probe_rsp,
+					   uint32_t probe_rsp_len, int32_t rssi)
 {
 	struct element_info link_probe_rsp = {0};
 	struct qdf_mac_addr sta_link_addr;
@@ -4254,6 +4363,17 @@ lim_gen_link_specific_probe_rsp(struct mac_context *mac_ctx,
 				goto end;
 			}
 		}
+		/*
+		 * If the partner link's AKM not matching current candidate
+		 * remove the partner links for this association.
+		 */
+		status = lim_check_partner_link_for_cmn_akm(session_entry);
+		if (QDF_IS_STATUS_ERROR(status)) {
+			pe_debug("Non overlapping partner link AKM, status(%d)",
+				 status);
+			lim_clear_ml_partner_info(session_entry);
+			goto end;
+		}
 	} else if (session_entry->lim_join_req->is_ml_probe_req_sent &&
 		   !rcvd_probe_resp->mlo_ie.mlo_ie_present) {
 		status =
@@ -4262,8 +4382,7 @@ lim_gen_link_specific_probe_rsp(struct mac_context *mac_ctx,
 		if (QDF_IS_STATUS_ERROR(status))
 			lim_clear_ml_partner_info(session_entry);
 
-		status = QDF_STATUS_E_FAILURE;
-		return status;
+		return QDF_STATUS_E_FAILURE;
 	} else {
 		return status;
 	}
